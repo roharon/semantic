@@ -1,6 +1,16 @@
-packages: . semantic-core
+packages: . semantic-core semantic-stream
 
 jobs: $ncpus
+
+package hlibgit2
+  extra-lib-dirs:      /usr/local/opt/openssl/lib
+  extra-include-dirs:  /usr/local/opt/openssl/include
+
+package text-icu
+  extra-lib-dirs:      /usr/local/lib
+                       /usr/local/opt/icu4c/lib
+  extra-include-dirs:  /usr/local/include
+                       /usr/local/opt/icu4c/include
 
 package semantic
   ghc-options: +RTS -A128m -n2m -RTS
