@@ -1,34 +1,43 @@
-{-# LANGUAGE DeriveAnyClass, LambdaCase, ScopedTypeVariables, TypeApplications, TypeFamilies, QuantifiedConstraints, AllowAmbiguousTypes #-}
-{-# OPTIONS_GHC -fprint-explicit-kinds #-}
+{-# LANGUAGE AllowAmbiguousTypes, DeriveAnyClass, LambdaCase, QuantifiedConstraints, ScopedTypeVariables, Rank2Types,
+             TypeApplications, TypeFamilies #-}
 
 module Main where
 
 import Prelude hiding (head)
 import Prologue
 
-import Control.Effect
-import Control.Effect.Catch
-import Control.Effect.Error
-import Control.Effect.Lift
-import Control.Effect.Reader
-import Control.Lens.Getter
-import Control.Monad.IO.Unlift
-import qualified Control.Monad.Reader as MTL
-import Data.Generics.Product
+import           Control.Effect
+import           Control.Effect.Catch
+import           Control.Effect.Error
+import           Control.Effect.Lift
+import           Control.Effect.Reader
 import qualified Control.Exception
-import Control.Monad.Catch (MonadMask)
-import Data.Tagged
+import qualified Control.Foldl as Foldl
+import           Control.Lens.Getter
+import           Control.Monad.Catch (MonadMask)
+import           Control.Monad.IO.Unlift
+import qualified Control.Monad.Reader as MTL
+import qualified Data.ByteString.Streaming.Aeson as Aeson
+import qualified Data.ByteString.Streaming.Char8 as ByteStream
+import           Data.Generics.Product
+import           Data.Tagged
+import           Data.Text.Encoding
+import           Data.Vector (Vector)
 import qualified Git
 import qualified Git.Libgit2
 import qualified Options.Applicative as Opt
+import           Streaming
 import qualified Streaming.Conduit as Conduit
 import qualified Streaming.Prelude as Streaming
-import Data.Text.Encoding
-import Data.Vector (Vector)
-import Streaming
-import qualified Control.Foldl as Foldl
-import qualified Data.ByteString.Streaming.Char8 as ByteStream
-import qualified Data.ByteString.Streaming.Aeson as Aeson
+import qualified Data.Conduit  as Conduit
+import qualified Data.Conduit.List  as Conduit
+
+import Data.AST
+import qualified Data.Tag as Data (Tag)
+import qualified Semantic.Api.V1.CodeAnalysisPB as Api
+import qualified Language.Go.Assignment as Go
+
+type ByteStream = ByteStream.ByteString
 
 data Config = Config
   { _outputFormat :: OutputFormat
@@ -55,10 +64,37 @@ data FatalException
 
 type GitM = MTL.ReaderT Git.Libgit2.LgRepo IO
 
-isInterestingTreeEntry :: Git.TreeEntry r -> Bool
-isInterestingTreeEntry = \case
-  Git.BlobEntry _ _ -> True
-  _                 -> False
+getBlobOid :: Git.TreeEntry r -> Maybe (Git.BlobOid r)
+getBlobOid = \case
+  Git.BlobEntry i _ -> Just i
+  _                 -> Nothing
+
+streamBlobContents :: Monad m => Git.Blob r m -> ByteStream m ()
+streamBlobContents blob = case Git.blobContents blob of
+  Git.BlobString b      -> ByteStream.fromStrict b
+  Git.BlobStringLazy b  -> ByteStream.fromLazy b
+  Git.BlobStream s      -> conduitToByteStream s
+
+parseFromByteStream :: ByteStream (ByteStream m) () -> ByteStream m Go.Term
+parseFromByteStream = undefined
+
+tagWithSlicing :: ByteStream m Go.Term -> Stream (Of Data.Tag) m ()
+tagWithSlicing = undefined
+
+tagBlob :: forall sig m r .
+           ( Member (Lift GitM) sig
+           , Carrier sig m
+           , MonadIO m
+           )
+        => Git.Blob r GitM -> m Api.File
+tagBlob blob =
+  hoist @_ @_ @m sendM (streamBlobContents blob)        -- ByteStream m ()
+  & ByteStream.copy                                     -- ByteStream (ByteStream m) ()
+  & parseFromByteStream                                 -- ByteStream m Go.Term
+  & tagWithSlicing                                      -- Stream (Of Data.Tag) m ()
+  & converting                                          -- Stream (Of Api.Symbol)
+  & Foldl.purely Streaming.fold_ (Foldl.vector @Vector) -- m (Vector Api.Symbol)
+  & fmap (makeFile blob)                                -- m Api.File
 
 pipeline :: forall m sig n r .
             ( n ~ GitM
@@ -77,11 +113,12 @@ pipeline = do
   let files = hoist @_ @n @m sendM cond
 
   files
-    & Streaming.filter (isInterestingTreeEntry . snd)
-    & Streaming.map (decodeUtf8 . fst)
-    & Foldl.purely Streaming.fold_ (Foldl.vector @Vector)
-    & fmap Aeson.encode
-    >>= ByteStream.stdout
+    & Streaming.mapMaybe (getBlobOid . snd)               -- Stream (Of (Git.BlobOid r)) m ()
+    & Streaming.mapM (sendM . Git.lookupBlob @_ @n)       -- Stream (Of (Git.Blob m r)) m ()
+    & Streaming.mapM tagBlob                              -- Stream (Of Api.File) m ()
+    & Foldl.purely Streaming.fold_ (Foldl.vector @Vector) -- m (Vector Api.File)
+    & fmap Aeson.encode                                   -- m (ByteStream m ())
+    >>= ByteStream.stdout                                 -- m ()
 
 
 main :: IO ()
@@ -104,3 +141,6 @@ main = do
   result & either Control.Exception.throw pure
 
 
+-- TODO: we can unsafeCoerce this away
+conduitToByteStream :: Monad m => Conduit.ConduitT () ByteString m () -> ByteStream m ()
+conduitToByteStream cnd = Conduit.runConduit (Conduit.transPipe MTL.lift cnd Conduit..| Conduit.mapM_ ByteStream.chunk)

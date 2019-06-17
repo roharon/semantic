@@ -56,3 +56,4 @@ executable semantic-stream
                      , text ^>= 1.2.3.1
                      , mtl ^>= 2.2
                      , unliftio-core ^>= 0.1.2.0
+                     , conduit
