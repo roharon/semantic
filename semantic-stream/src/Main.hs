@@ -1,4 +1,4 @@
-{-# LANGUAGE AllowAmbiguousTypes, DeriveAnyClass, LambdaCase, QuantifiedConstraints, ScopedTypeVariables, Rank2Types,
+{-# LANGUAGE AllowAmbiguousTypes, DeriveAnyClass, LambdaCase, QuantifiedConstraints, Rank2Types, ScopedTypeVariables,
              TypeApplications, TypeFamilies #-}
 
 module Main where
@@ -14,34 +14,34 @@ import           Control.Effect.Reader
 import qualified Control.Exception
 import qualified Control.Foldl as Foldl
 import           Control.Lens.Getter
-import qualified Data.ByteString.Lens as Lens
 import           Control.Monad.Catch (MonadMask)
 import           Control.Monad.IO.Unlift
 import qualified Control.Monad.Reader as MTL
 import           Data.Aeson (ToJSON (..))
 import qualified Data.ByteString.Lazy as LB
+import qualified Data.ByteString.Lens as Lens
 import qualified Data.ByteString.Streaming.Aeson as Aeson
 import qualified Data.ByteString.Streaming.Char8 as ByteStream
+import qualified Data.Conduit as Conduit
+import qualified Data.Conduit.List as Conduit
 import           Data.Generics.Product
 import           Data.Tagged
-import           Data.Text.Lazy.Encoding as LT
 import qualified Data.Text.Lazy as LT
+import           Data.Text.Lazy.Encoding as LT
 import           Data.Vector (Vector)
+import           GHC.Conc
 import qualified Git
 import qualified Git.Libgit2
 import qualified Options.Applicative as Opt
 import           Streaming
 import qualified Streaming.Conduit as Conduit
 import qualified Streaming.Prelude as Streaming
-import qualified Data.Conduit  as Conduit
-import qualified Data.Conduit.List  as Conduit
-import GHC.Conc
 
-import Data.Language
-import Data.AST
+import           Data.AST
+import           Data.Language
 import qualified Data.Tag as Data (Tag)
-import qualified Semantic.Api.V1.CodeAnalysisPB as Api
 import qualified Language.Go.Assignment as Go
+import qualified Semantic.Api.V1.CodeAnalysisPB as Api
 
 type ByteStream = ByteStream.ByteString
 
@@ -92,13 +92,13 @@ toResult (str :> (int :> ())) = Result int (LT.decodeUtf8 (fromMaybe "ERROR" str
 
 summarizeBlob :: Git.MonadGit Git.Libgit2.LgRepo m => Git.Blob Git.Libgit2.LgRepo m -> m Result
 summarizeBlob blob
-  = streamBlobContents blob        -- ByteStream m ()
-  & ByteStream.copy                -- ByteStream (ByteStream m) ()
-  & ByteStream.length              -- ByteStream m (Of Int ())
-  & ByteStream.lines               -- Stream (ByteString m) m (Of Int ())
+  = streamBlobContents blob            -- ByteStream m ()
+  & ByteStream.copy                    -- ByteStream (ByteStream m) ()
+  & ByteStream.length                  -- ByteStream m (Of Int ())
+  & ByteStream.lines                   -- Stream (ByteString m) m (Of Int ())
   & Streaming.mapped ByteStream.toLazy -- Stream (Of LB.ByteString) m (Of Int ())
-  & Streaming.last
-  & fmap toResult
+  & Streaming.last                     -- m (Of (Maybe LB.ByteString) (Of Int ()))
+  & fmap toResult                      -- m Result
 
 isAppropriate :: Git.TreeFilePath -> Git.TreeEntry r -> Bool
 isAppropriate (Lens.Chars p) ent
