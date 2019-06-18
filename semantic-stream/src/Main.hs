@@ -14,14 +14,18 @@ import           Control.Effect.Reader
 import qualified Control.Exception
 import qualified Control.Foldl as Foldl
 import           Control.Lens.Getter
+import qualified Data.ByteString.Lens as Lens
 import           Control.Monad.Catch (MonadMask)
 import           Control.Monad.IO.Unlift
 import qualified Control.Monad.Reader as MTL
+import           Data.Aeson (ToJSON (..))
+import qualified Data.ByteString.Lazy as LB
 import qualified Data.ByteString.Streaming.Aeson as Aeson
 import qualified Data.ByteString.Streaming.Char8 as ByteStream
 import           Data.Generics.Product
 import           Data.Tagged
-import           Data.Text.Encoding
+import           Data.Text.Lazy.Encoding as LT
+import qualified Data.Text.Lazy as LT
 import           Data.Vector (Vector)
 import qualified Git
 import qualified Git.Libgit2
@@ -31,7 +35,9 @@ import qualified Streaming.Conduit as Conduit
 import qualified Streaming.Prelude as Streaming
 import qualified Data.Conduit  as Conduit
 import qualified Data.Conduit.List  as Conduit
+import GHC.Conc
 
+import Data.Language
 import Data.AST
 import qualified Data.Tag as Data (Tag)
 import qualified Semantic.Api.V1.CodeAnalysisPB as Api
@@ -41,6 +47,7 @@ type ByteStream = ByteStream.ByteString
 
 data Config = Config
   { _outputFormat :: OutputFormat
+  , _bufferSize   :: Int
   , _gitDirectory :: FilePath
   } deriving (Eq, Show, Generic)
 
@@ -55,7 +62,10 @@ outputFormat = proto <|> json where
   proto = Opt.flag' AsProto (Opt.long "proto")
 
 options :: Opt.Parser Config
-options = Config <$> outputFormat <*> Opt.strArgument (Opt.help "[DIRECTORY]")
+options = Config
+  <$> outputFormat
+  <*> Opt.option Opt.auto (Opt.long "buffer-size" <> Opt.value numCapabilities)
+  <*> Opt.strArgument (Opt.help "[DIRECTORY]")
 
 data FatalException
   = CouldNotResolveHEAD
@@ -69,32 +79,32 @@ getBlobOid = \case
   Git.BlobEntry i _ -> Just i
   _                 -> Nothing
 
-streamBlobContents :: Monad m => Git.Blob r m -> ByteStream m ()
-streamBlobContents blob = case Git.blobContents blob of
-  Git.BlobString b      -> ByteStream.fromStrict b
-  Git.BlobStringLazy b  -> ByteStream.fromLazy b
-  Git.BlobStream s      -> conduitToByteStream s
+streamBlobContents :: Git.MonadGit Git.Libgit2.LgRepo m => Git.Blob Git.Libgit2.LgRepo m -> ByteStream m ()
+streamBlobContents = ByteStream.mwrap . fmap ByteStream.fromLazy . Git.blobToLazyByteString
 
-parseFromByteStream :: ByteStream (ByteStream m) () -> ByteStream m Go.Term
-parseFromByteStream = undefined
+data Result = Result
+  { _totalLength :: Int
+  , _lastLine    :: LT.Text
+  } deriving (Eq, Show, Ord, Generic, ToJSON)
 
-tagWithSlicing :: ByteStream m Go.Term -> Stream (Of Data.Tag) m ()
-tagWithSlicing = undefined
+toResult :: Of (Maybe LB.ByteString) (Of Int ()) -> Result
+toResult (str :> (int :> ())) = Result int (LT.decodeUtf8 (fromMaybe "ERROR" str))
 
-tagBlob :: forall sig m r .
-           ( Member (Lift GitM) sig
-           , Carrier sig m
-           , MonadIO m
-           )
-        => Git.Blob r GitM -> m Api.File
-tagBlob blob =
-  hoist @_ @_ @m sendM (streamBlobContents blob)        -- ByteStream m ()
-  & ByteStream.copy                                     -- ByteStream (ByteStream m) ()
-  & parseFromByteStream                                 -- ByteStream m Go.Term
-  & tagWithSlicing                                      -- Stream (Of Data.Tag) m ()
-  & converting                                          -- Stream (Of Api.Symbol)
-  & Foldl.purely Streaming.fold_ (Foldl.vector @Vector) -- m (Vector Api.Symbol)
-  & fmap (makeFile blob)                                -- m Api.File
+summarizeBlob :: Git.MonadGit Git.Libgit2.LgRepo m => Git.Blob Git.Libgit2.LgRepo m -> m Result
+summarizeBlob blob
+  = streamBlobContents blob        -- ByteStream m ()
+  & ByteStream.copy                -- ByteStream (ByteStream m) ()
+  & ByteStream.length              -- ByteStream m (Of Int ())
+  & ByteStream.lines               -- Stream (ByteString m) m (Of Int ())
+  & Streaming.mapped ByteStream.toLazy -- Stream (Of LB.ByteString) m (Of Int ())
+  & Streaming.last
+  & fmap toResult
+
+isAppropriate :: Git.TreeFilePath -> Git.TreeEntry r -> Bool
+isAppropriate (Lens.Chars p) ent
+  | Git.BlobEntry _ Git.PlainBlob <- ent, languageForFilePath p /= Unknown = True
+  | otherwise = False
+
 
 pipeline :: forall m sig n r .
             ( n ~ GitM
@@ -113,9 +123,10 @@ pipeline = do
   let files = hoist @_ @n @m sendM cond
 
   files
+    & Streaming.filter (uncurry isAppropriate)
     & Streaming.mapMaybe (getBlobOid . snd)               -- Stream (Of (Git.BlobOid r)) m ()
     & Streaming.mapM (sendM . Git.lookupBlob @_ @n)       -- Stream (Of (Git.Blob m r)) m ()
-    & Streaming.mapM tagBlob                              -- Stream (Of Api.File) m ()
+    & Streaming.mapM (sendM . summarizeBlob)          -- Stream (Of Result) m ()
     & Foldl.purely Streaming.fold_ (Foldl.vector @Vector) -- m (Vector Api.File)
     & fmap Aeson.encode                                   -- m (ByteStream m ())
     >>= ByteStream.stdout                                 -- m ()
@@ -129,7 +140,7 @@ main = do
                                           , Git.repoIsBare = False
                                           , Git.repoAutoCreate = False
                                           }
-
+  -- let buffer = Streaming.Concurrent.bounded
   result <- Git.withRepository' Git.Libgit2.lgFactory repoOptions
     $ runM @GitM
     . withCatch
