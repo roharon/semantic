@@ -123,11 +123,11 @@ pipeline = do
   let files = hoist @_ @n @m sendM cond
 
   files
-    & Streaming.filter (uncurry isAppropriate)
+    & Streaming.filter (uncurry isAppropriate)            -- Stream (Of (TreeFilePath, TreeEntry r)) m ()
     & Streaming.mapMaybe (getBlobOid . snd)               -- Stream (Of (Git.BlobOid r)) m ()
     & Streaming.mapM (sendM . Git.lookupBlob @_ @n)       -- Stream (Of (Git.Blob m r)) m ()
-    & Streaming.mapM (sendM . summarizeBlob)          -- Stream (Of Result) m ()
-    & Foldl.purely Streaming.fold_ (Foldl.vector @Vector) -- m (Vector Api.File)
+    & Streaming.mapM (sendM . summarizeBlob)              -- Stream (Of Result) m ()
+    & Foldl.purely Streaming.fold_ (Foldl.vector @Vector) -- m (Vector Result)
     & fmap Aeson.encode                                   -- m (ByteStream m ())
     >>= ByteStream.stdout                                 -- m ()
 
