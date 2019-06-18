@@ -36,6 +36,7 @@ executable semantic-stream
   hs-source-dirs:      src
   main-is:             Main.hs
   default-language:    Haskell2010
+  ghc-options:         -Wall
   build-depends:       base >= 4.7 && < 5
                      , semantic
                      , exceptions

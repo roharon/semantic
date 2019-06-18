@@ -1,5 +1,5 @@
 {-# LANGUAGE AllowAmbiguousTypes, DeriveAnyClass, LambdaCase, QuantifiedConstraints, Rank2Types, ScopedTypeVariables,
-             TypeApplications, TypeFamilies #-}
+             TypeApplications, ViewPatterns, TypeFamilies #-}
 
 module Main where
 
@@ -18,14 +18,16 @@ import           Control.Monad.Catch (MonadMask)
 import           Control.Monad.IO.Unlift
 import qualified Control.Monad.Reader as MTL
 import           Data.Aeson (ToJSON (..))
+import           Data.ByteString.Char8 as BC
 import qualified Data.ByteString.Lazy as LB
-import qualified Data.ByteString.Lens as Lens
 import qualified Data.ByteString.Streaming.Aeson as Aeson
 import qualified Data.ByteString.Streaming.Char8 as ByteStream
 import qualified Data.Conduit as Conduit
 import qualified Data.Conduit.List as Conduit
 import           Data.Generics.Product
 import           Data.Tagged
+import qualified Data.Text as T
+import           Data.Text.Encoding as T
 import qualified Data.Text.Lazy as LT
 import           Data.Text.Lazy.Encoding as LT
 import           Data.Vector (Vector)
@@ -37,11 +39,11 @@ import           Streaming
 import qualified Streaming.Conduit as Conduit
 import qualified Streaming.Prelude as Streaming
 
-import           Data.AST
+-- import           Data.AST
 import           Data.Language
-import qualified Data.Tag as Data (Tag)
-import qualified Language.Go.Assignment as Go
-import qualified Semantic.Api.V1.CodeAnalysisPB as Api
+-- import qualified Data.Tag as Data (Tag)
+-- import qualified Language.Go.Assignment as Go
+-- import qualified Semantic.Api.V1.CodeAnalysisPB as Api
 
 type ByteStream = ByteStream.ByteString
 
@@ -84,52 +86,60 @@ streamBlobContents = ByteStream.mwrap . fmap ByteStream.fromLazy . Git.blobToLaz
 
 data Result = Result
   { _totalLength :: Int
-  , _lastLine    :: LT.Text
+  , _lastLine    :: T.Text
   } deriving (Eq, Show, Ord, Generic, ToJSON)
 
-toResult :: Of (Maybe LB.ByteString) (Of Int ()) -> Result
-toResult (str :> (int :> ())) = Result int (LT.decodeUtf8 (fromMaybe "ERROR" str))
+toResult :: Of (Maybe BC.ByteString) (Of Int ()) -> Result
+toResult (str :> (int :> ())) = Result int (T.decodeUtf8 (fromMaybe "ERROR" str))
+{-# INLINE toResult #-}
 
-summarizeBlob :: Git.MonadGit Git.Libgit2.LgRepo m => Git.Blob Git.Libgit2.LgRepo m -> m Result
-summarizeBlob blob
-  = streamBlobContents blob            -- ByteStream m ()
-  & ByteStream.copy                    -- ByteStream (ByteStream m) ()
-  & ByteStream.length                  -- ByteStream m (Of Int ())
-  & ByteStream.lines                   -- Stream (ByteString m) m (Of Int ())
-  & Streaming.mapped ByteStream.toLazy -- Stream (Of LB.ByteString) m (Of Int ())
-  & Streaming.last                     -- m (Of (Maybe LB.ByteString) (Of Int ()))
-  & fmap toResult                      -- m Result
+summarize :: Git.MonadGit Git.Libgit2.LgRepo m => Git.Blob Git.Libgit2.LgRepo m -> m Result
+summarize
+  = fmap toResult                        -- m Result
+  . Streaming.last                       -- m (Of (Maybe B.ByteString) (Of Int ()))
+  . Streaming.mapped ByteStream.toStrict -- Stream (Of B.ByteString) m (Of Int ())
+  . ByteStream.lines                     -- Stream (ByteString m) m (Of Int ())
+  . ByteStream.length                    -- ByteStream m (Of Int ())
+  . ByteStream.copy                      -- ByteStream (ByteStream m) ()
+  . streamBlobContents                   -- ByteStream m ()
+
 
 isAppropriate :: Git.TreeFilePath -> Git.TreeEntry r -> Bool
-isAppropriate (Lens.Chars p) ent
+isAppropriate (BC.unpack -> p) ent
   | Git.BlobEntry _ Git.PlainBlob <- ent, languageForFilePath p /= Unknown = True
   | otherwise = False
 
 
-pipeline :: forall m sig n r .
-            ( n ~ GitM
+
+pipeline :: forall n m sig r .
+            ( Git.Libgit2.HasLgRepo n
+            , Git.MonadGit r n
+            , MonadUnliftIO n
+            , MonadMask n
             , Member (Lift n) sig
             , Member (Error FatalException) sig
             , Carrier sig m
+            , MonadIO n
             , MonadIO m
             ) => m ()
 pipeline = do
+  let git :: n a -> m a
+      git = sendM @n
 
-  mHeadRef <- sendM (Git.resolveReference @_ @n "HEAD")
-  headRef <- maybeM (throwError CouldNotResolveHEAD) mHeadRef
-  headCommit <- sendM . Git.lookupCommit @_ @n . Tagged $ headRef
-  headTree <- sendM . Git.lookupTree @_ @n . Git.commitTree $ headCommit
-  let cond = Conduit.toStream $ Git.sourceTreeEntries @_ @n headTree
-  let files = hoist @_ @n @m sendM cond
+  headRef  <- git (Git.resolveReference "HEAD") >>= maybeM (throwError CouldNotResolveHEAD)
+  headTree <- git (Git.lookupCommit (Tagged headRef) >>= Git.lookupTree . Git.commitTree)
 
-  files
-    & Streaming.filter (uncurry isAppropriate)            -- Stream (Of (TreeFilePath, TreeEntry r)) m ()
-    & Streaming.mapMaybe (getBlobOid . snd)               -- Stream (Of (Git.BlobOid r)) m ()
-    & Streaming.mapM (sendM . Git.lookupBlob @_ @n)       -- Stream (Of (Git.Blob m r)) m ()
-    & Streaming.mapM (sendM . summarizeBlob)              -- Stream (Of Result) m ()
-    & Foldl.purely Streaming.fold_ (Foldl.vector @Vector) -- m (Vector Result)
-    & fmap Aeson.encode                                   -- m (ByteStream m ())
-    >>= ByteStream.stdout                                 -- m ()
+  -- This 'hoist' is necessary so that we can run gitStream in 'm' rather than 'n'
+  let gitStream = hoist @_ @n @m sendM (Conduit.toStream (Git.sourceTreeEntries headTree))
+
+  gitStream
+    & Streaming.filter (uncurry isAppropriate)              -- Stream (Of (TreeFilePath, TreeEntry r)) m ()
+    & Streaming.mapMaybe (getBlobOid . snd)                 -- Stream (Of (Git.BlobOid r)) m ()
+    & Streaming.mapM (git . (Git.lookupBlob >=> summarize)) -- Stream (Of Result) m ()
+    & Foldl.purely Streaming.fold_ (Foldl.vector @Vector)   -- m (Vector Result)
+    & fmap Aeson.encode                                     -- m (ByteStream m ())
+    >>= ByteStream.stdout                                   -- m ()
+
 
 
 main :: IO ()
@@ -140,14 +150,14 @@ main = do
                                           , Git.repoIsBare = False
                                           , Git.repoAutoCreate = False
                                           }
-  -- let buffer = Streaming.Concurrent.bounded
-  result <- Git.withRepository' Git.Libgit2.lgFactory repoOptions
-    $ runM @GitM
+
+  result <- Git.withRepository' (Git.Libgit2.lgFactory @IO) repoOptions
+    $ runM
     . withCatch
     . runError @FatalException
     . flip catchSync (throwError . UnhandledException)
     . runReader config
-    $ pipeline
+    $ pipeline @(MTL.ReaderT Git.Libgit2.LgRepo IO)
 
   result & either Control.Exception.throw pure
 
