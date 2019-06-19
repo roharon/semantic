@@ -1,5 +1,5 @@
 {-# LANGUAGE AllowAmbiguousTypes, DeriveAnyClass, LambdaCase, QuantifiedConstraints, Rank2Types, ScopedTypeVariables,
-             TypeApplications, ViewPatterns, TypeFamilies #-}
+             TypeApplications, TypeFamilies, ViewPatterns #-}
 
 module Main where
 
@@ -18,8 +18,8 @@ import           Control.Monad.Catch (MonadMask)
 import           Control.Monad.IO.Unlift
 import qualified Control.Monad.Reader as MTL
 import           Data.Aeson (ToJSON (..))
-import           Data.ByteString.Char8 as BC
-import qualified Data.ByteString.Lazy as LB
+import           Data.ByteString.Char8 as B
+import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Streaming.Aeson as Aeson
 import qualified Data.ByteString.Streaming.Char8 as ByteStream
 import qualified Data.Conduit as Conduit
@@ -28,8 +28,8 @@ import           Data.Generics.Product
 import           Data.Tagged
 import qualified Data.Text as T
 import           Data.Text.Encoding as T
-import qualified Data.Text.Lazy as LT
-import           Data.Text.Lazy.Encoding as LT
+import qualified Data.Text.Lazy as TL
+import           Data.Text.Lazy.Encoding as TL
 import           Data.Vector (Vector)
 import           GHC.Conc
 import qualified Git
@@ -40,7 +40,7 @@ import qualified Streaming.Conduit as Conduit
 import qualified Streaming.Prelude as Streaming
 
 -- import           Data.AST
-import           Data.Language
+import Data.Language
 -- import qualified Data.Tag as Data (Tag)
 -- import qualified Language.Go.Assignment as Go
 -- import qualified Semantic.Api.V1.CodeAnalysisPB as Api
@@ -81,32 +81,37 @@ getBlobOid = \case
   Git.BlobEntry i _ -> Just i
   _                 -> Nothing
 
-streamBlobContents :: Git.MonadGit Git.Libgit2.LgRepo m => Git.Blob Git.Libgit2.LgRepo m -> ByteStream m ()
-streamBlobContents = ByteStream.mwrap . fmap ByteStream.fromLazy . Git.blobToLazyByteString
 
 data Result = Result
   { _totalLength :: Int
   , _lastLine    :: T.Text
   } deriving (Eq, Show, Ord, Generic, ToJSON)
 
-toResult :: Of (Maybe BC.ByteString) (Of Int ()) -> Result
-toResult (str :> (int :> ())) = Result int (T.decodeUtf8 (fromMaybe "ERROR" str))
-{-# INLINE toResult #-}
+toResult :: Of (Maybe B.ByteString) (Of Int ()) -> Result
+toResult (str :> (int :> ())) = Result int (T.decodeUtf8 (fromMaybe "error" str))
 
-summarize :: Git.MonadGit Git.Libgit2.LgRepo m => Git.Blob Git.Libgit2.LgRepo m -> m Result
+summarize :: ( MonadMask m
+             , MonadUnliftIO m
+             , Git.MonadGit r m
+             , Git.Libgit2.HasLgRepo m
+             )
+          => Git.Blob r m
+          -> m Result
 summarize
   = fmap toResult                        -- m Result
-  . Streaming.last                       -- m (Of (Maybe B.ByteString) (Of Int ()))
-  . Streaming.mapped ByteStream.toStrict -- Stream (Of B.ByteString) m (Of Int ())
-  . ByteStream.lines                     -- Stream (ByteString m) m (Of Int ())
-  . ByteStream.length                    -- ByteStream m (Of Int ())
+  . Streaming.last                       -- m (Of (Maybe Strict.ByteString) (Of Int ()))
+  . Streaming.mapped ByteStream.toStrict -- Stream (Of Strict.ByteString) m (Of Int ())
+  . ByteStream.lines                     -- Stream (ByteString m) m Int
+  . ByteStream.length                    -- ByteStream m Int
   . ByteStream.copy                      -- ByteStream (ByteStream m) ()
-  . streamBlobContents                   -- ByteStream m ()
+  . ByteStream.mwrap                     -- ByteStream m ()
+  . fmap ByteStream.fromLazy             -- m (ByteStream m ())
+  . Git.blobToLazyByteString             -- m LB.ByteString
 
 
 isAppropriate :: Git.TreeFilePath -> Git.TreeEntry r -> Bool
-isAppropriate (BC.unpack -> p) ent
-  | Git.BlobEntry _ Git.PlainBlob <- ent, languageForFilePath p /= Unknown = True
+isAppropriate (B.unpack -> p) ent
+  | Git.BlobEntry _ Git.PlainBlob <- ent = languageForFilePath p == Go
   | otherwise = False
 
 
@@ -132,13 +137,15 @@ pipeline = do
   -- This 'hoist' is necessary so that we can run gitStream in 'm' rather than 'n'
   let gitStream = hoist @_ @n @m sendM (Conduit.toStream (Git.sourceTreeEntries headTree))
 
-  gitStream
-    & Streaming.filter (uncurry isAppropriate)              -- Stream (Of (TreeFilePath, TreeEntry r)) m ()
-    & Streaming.mapMaybe (getBlobOid . snd)                 -- Stream (Of (Git.BlobOid r)) m ()
-    & Streaming.mapM (git . (Git.lookupBlob >=> summarize)) -- Stream (Of Result) m ()
-    & Foldl.purely Streaming.fold_ (Foldl.vector @Vector)   -- m (Vector Result)
-    & fmap Aeson.encode                                     -- m (ByteStream m ())
-    >>= ByteStream.stdout                                   -- m ()
+  ByteStream.stdout =<<
+    ( fmap Aeson.encode                                     -- m (ByteStream m ())
+    . Foldl.purely Streaming.fold_ (Foldl.vector @Vector)   -- m (Vector Result)
+    . Streaming.mapM (git . (Git.lookupBlob >=> summarize)) -- Stream (Of Result) m ()
+    . Streaming.mapMaybe (getBlobOid . snd)                 -- Stream (Of (Git.BlobOid r)) m ()
+    . Streaming.filter (uncurry isAppropriate)              -- Stream (Of (TreeFilePath, TreeEntry r)) m ()
+    $ gitStream                                             -- Stream (Of (TreeFilePath, TreeEntry r)) m ()
+    )
+
 
 
 
