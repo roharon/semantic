@@ -1,4 +1,4 @@
-{-# LANGUAGE DefaultSignatures, DeriveGeneric, FlexibleContexts, FlexibleInstances, RecordWildCards, StandaloneDeriving, TypeOperators #-}
+{-# LANGUAGE DefaultSignatures, DeriveGeneric, FlexibleContexts, FlexibleInstances, RecordWildCards, StandaloneDeriving, TypeOperators, NamedFieldPuns #-}
 module Language.Python.Core
 ( compile
 ) where
@@ -6,17 +6,18 @@ module Language.Python.Core
 import           Control.Monad.Fail
 import           Data.Core as Core
 import           Data.Name as Name
+import           Data.Term
 import           GHC.Generics
 import           Prelude hiding (fail)
 import qualified TreeSitter.Python.AST as Py
 
 class Compile t where
   -- FIXME: we should really try not to fail
-  compile :: MonadFail m => t -> m Core
-  default compile :: (MonadFail m, Show t) => t -> m Core
+  compile :: MonadFail m => t -> m (Term Core Name)
+  default compile :: (MonadFail m, Show t) => t -> m (Term Core Name)
   compile = defaultCompile
 
-defaultCompile :: (MonadFail m, Show t) => t -> m Core
+defaultCompile :: (MonadFail m, Show t) => t -> m (Term Core Name)
 defaultCompile t = fail $ "compilation unimplemented for " <> show t
 
 instance (Compile l, Compile r) => Compile (Either l r) where compile = compileSum
@@ -48,7 +49,7 @@ instance Compile Py.Expression where compile = compileSum
 
 instance Compile Py.ExpressionStatement
 
-instance Compile Py.False where compile _ = pure (Bool False)
+instance Compile Py.False where compile _ = pure (Core.bool False)
 
 instance Compile Py.Float
 instance Compile Py.ForStatement
@@ -59,41 +60,38 @@ instance Compile Py.FunctionDefinition where
     , parameters = Py.Parameters parameters
     , ..
     } = do
-      parameters' <- params
-      body' <- compile body
-      pure (Let (User name) := lams parameters' body')
-    where params = case parameters of
-            Nothing -> pure []
-            Just p  -> traverse param [p] -- FIXME: this is wrong in node-types.json, @p@ should already be a list
-          param (Right (Right (Right (Left (Py.Identifier name))))) = pure (User name)
-          param x = unimplemented x
-          unimplemented x = fail $ "unimplemented: " <> show x
+      -- parameters' <- _params
+      -- body' <- compile body
+      fail "can't!"
+    -- where params = case parameters of
+    --         Nothing -> pure []
+    --         Just p  -> traverse param [p] -- FIXME: this is wrong in node-types.json, @p@ should already be a list
+    --       param (Right (Right (Right (Left (Py.Identifier name))))) = pure name
+    --       param x = unimplemented x
+    --       unimplemented x = fail $ "unimplemented: " <> show x
 
 instance Compile Py.FutureImportStatement
 instance Compile Py.GeneratorExpression
 instance Compile Py.GlobalStatement
 
 instance Compile Py.Identifier where
-  compile (Py.Identifier text) = pure (Var (User text))
+  compile (Py.Identifier text) = pure (Var text)
 
 instance Compile Py.IfStatement where
-  compile Py.IfStatement{..} = If <$> compile condition <*> compile consequence <*> case alternative of
-    Nothing      -> pure Unit
-    Just clauses -> foldr clause (pure Unit) clauses
-    where clause (Left  Py.ElifClause{..}) rest = If <$> compile condition <*> compile consequence <*> rest
+  compile Py.IfStatement{alternative, consequence, condition}
+    = Core.if' <$> compile condition <*> compile consequence <*> foldr clause (pure Core.unit) alternative
+    where clause (Left  Py.ElifClause{..}) rest = Core.if' <$> compile condition <*> compile consequence <*> rest
           clause (Right Py.ElseClause{..}) _    = compile body
 
 instance Compile Py.ImportFromStatement
 instance Compile Py.ImportStatement
 instance Compile Py.Integer
-instance Compile Py.KeywordIdentifier
 instance Compile Py.Lambda
 instance Compile Py.List
 instance Compile Py.ListComprehension
 
 instance Compile Py.Module where
-  compile (Py.Module Nothing)           = pure Unit
-  compile (Py.Module (Just statements)) = block <$> traverse compile statements
+  compile (Py.Module statements) = do' . fmap (Nothing :<-) <$> traverse compile statements
 
 instance Compile Py.NamedExpression
 instance Compile Py.None
@@ -115,7 +113,7 @@ instance Compile Py.SimpleStatement where compile = compileSum
 instance Compile Py.String
 instance Compile Py.Subscript
 
-instance Compile Py.True where compile _ = pure (Bool True)
+instance Compile Py.True where compile _ = pure $ Core.bool True
 
 instance Compile Py.TryStatement
 instance Compile Py.Tuple
@@ -124,11 +122,11 @@ instance Compile Py.WhileStatement
 instance Compile Py.WithStatement
 
 
-compileSum :: (Generic t, GCompileSum (Rep t), MonadFail m) => t -> m Core
+compileSum :: (Generic t, GCompileSum (Rep t), MonadFail m) => t -> m (Term Core Name)
 compileSum = gcompileSum . from
 
 class GCompileSum f where
-  gcompileSum :: MonadFail m => f a -> m Core
+  gcompileSum :: MonadFail m => f a -> m (Term Core Name)
 
 instance GCompileSum f => GCompileSum (M1 D d f) where
   gcompileSum (M1 f) = gcompileSum f
