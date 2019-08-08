@@ -54,22 +54,19 @@ instance Compile Py.False where compile _ = pure (Core.bool False)
 instance Compile Py.Float
 instance Compile Py.ForStatement
 
-instance Compile Py.FunctionDefinition where
-  compile Py.FunctionDefinition
-    { name       = Py.Identifier name
-    , parameters = Py.Parameters parameters
-    , body
-    } = do
-      names <- paramNames
-      let binders = fmap (\n -> (Name.namedName n, Core.unit)) names
-      body' <- compile body
-      pure ((Name.named' name) :<- (Core.record binders) >>>= Core.lams names body')
-    where paramNames = case parameters of
-            Nothing -> pure []
-            Just p  -> traverse param [p] -- FIXME: this is wrong in node-types.json, @p@ should already be a list
-          param (Right (Right (Right (Left (Py.Identifier name))))) = pure (Name.named' name)
-          param x = unimplemented x
-          unimplemented x = fail $ "unimplemented: " <> show x
+-- This API needs to change before it will work.
+instance Compile Py.FunctionDefinition -- where
+  -- compile Py.FunctionDefinition
+  --   { name       = Py.Identifier name
+  --   , parameters = Py.Parameters parameters
+  --   , body
+  --   } = Core.lams <$> paramNames <*> compile body
+  --   where paramNames = case parameters of
+  --           Nothing -> pure []
+  --           Just p  -> traverse param [p] -- FIXME: this is wrong in node-types.json, @p@ should already be a list
+  --         param (Right (Right (Right (Left (Py.Identifier name))))) = pure (Name.named' name)
+  --         param x = unimplemented x
+  --         unimplemented x = fail $ "unimplemented: " <> show x
 
 instance Compile Py.FutureImportStatement
 instance Compile Py.GeneratorExpression
